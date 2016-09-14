@@ -17,12 +17,12 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"log"
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/minio/s3v2tov4-proxy/s3auth"
 	"github.com/vulcand/oxy/forward"
@@ -37,14 +37,14 @@ type v2ToV4Proxy struct {
 }
 
 func (p v2ToV4Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if strings.Contains(r.Header.Get("Authorization"), s3auth.SignV4Algorithm) {
-		r.URL.Scheme = p.fwdURL.Scheme
-		r.URL.Host = p.fwdURL.Host
-		// If the signature is V4 then pass through the request as is
-		// as it will be authenticated by the Minio server.
-		p.fwdHandler.ServeHTTP(w, r)
-		return
-	}
+	// if strings.Contains(r.Header.Get("Authorization"), s3auth.SignV4Algorithm) {
+	// 	r.URL.Scheme = p.fwdURL.Scheme
+	// 	r.URL.Host = p.fwdURL.Host
+	// 	// If the signature is V4 then pass through the request as is
+	// 	// as it will be authenticated by the Minio server.
+	// 	p.fwdHandler.ServeHTTP(w, r)
+	// 	return
+	// }
 
 	// url.RawPath will be valid if path has any encoded characters, if not it will
 	// be empty - in which case we need to consider url.Path (bug in net/http?)
@@ -57,21 +57,26 @@ func (p v2ToV4Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	expectedAuth := p.ingress.Sign(r.Method, encodedResource, encodedQuery, r.Header)
-	gotAuth := r.Header.Get("Authorization")
+	if strings.Contains(r.Header.Get("Authorization"), s3auth.SignV4Algorithm) {
+		// TODO: Verify V4 Signature
+	} else {
+		expectedAuth := p.ingress.Sign(r.Method, encodedResource, encodedQuery, r.Header)
+		gotAuth := r.Header.Get("Authorization")
 
-	if gotAuth != expectedAuth {
-		log.Printf("Signature mismatch error: got: %s, expected:%s\n", gotAuth, expectedAuth)
-		errStr := "Signature mismatch"
-		http.Error(w, errStr, http.StatusForbidden)
-		return
+		if gotAuth != expectedAuth {
+			log.Printf("Signature mismatch error: got: %s, expected:%s\n", gotAuth, expectedAuth)
+			errStr := "Signature mismatch"
+			http.Error(w, errStr, http.StatusForbidden)
+			return
+		}
 	}
 
-	dateStr := time.Now().UTC().Format(s3auth.DateFormat)
-	r.Header.Set("X-Amz-Date", dateStr) // Mandatory for V4 signature.
-	r.Header.Set("Host", r.Host)        // Host header at the ingress will be availabe as r.Host
+	//dateStr := time.Now().UTC().Format(s3auth.DateFormat)
+	//r.Header.Set("X-Amz-Date", dateStr) // Mandatory for V4 signature.
+	r.Host = p.fwdURL.Host       // Set Host on request to egress host
+	r.Header.Set("Host", r.Host) // Host header at the ingress will be availabe as r.Host
 	// We don't compute SHA256 for the data. (This is a proxy we won't be inspecting the data).
-	r.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	//r.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
 
 	// In case _ or - ro ~ were encoded, decode it - to be V4 compatible.
 	encodedResource = canonicalEncoding(encodedResource)
@@ -87,6 +92,7 @@ func (p v2ToV4Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Forward the request to Minio server.
 	r.URL.Scheme = p.fwdURL.Scheme
 	r.URL.Host = p.fwdURL.Host
+
 	p.fwdHandler.ServeHTTP(w, r)
 }
 
@@ -132,7 +138,7 @@ func main() {
 	fwd, err := forward.New(
 		forward.PassHostHeader(true),
 		forward.Rewriter(norewrite{}),
-		forward.RoundTripper(&http.Transport{DisableCompression: true}),
+		forward.RoundTripper(&http.Transport{DisableCompression: true, TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}),
 	)
 	if err != nil {
 		log.Fatalln("Unable to initialize forwarding handler", err)
@@ -148,7 +154,7 @@ func main() {
 				SecretKey: *secretKey,
 				Region:    *region,
 			},
-			egress: s3auth.CredentialsV4{
+			egress: s3auth.CredentialsV2{
 				AccessKey: *accessKey,
 				SecretKey: *secretKey,
 				Region:    *region,
